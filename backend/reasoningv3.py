@@ -39,8 +39,8 @@ try:
         MetricsManager, trace, SpanKind, Status, StatusCode
     )
     # Reasoning often needs Memory and LLMs (via Integration)
-    from memoryv3 import MemoryV3, MemoryItem
-    from integrationv3 import IntegrationV3, LLMInterface
+    from backend.memoryv3 import MemoryV3, MemoryItem
+    from backend.integrationv3 import IntegrationV3, LLMInterface
 except ImportError as e:
     print(f"FATAL ERROR: Could not import dependencies from enhanced-core-v2/*v3: {e}")
     # Add dummy fallbacks

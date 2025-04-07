@@ -1,0 +1,45 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'nces'
+    static_configs:
+      - targets: ['localhost:8001']  # NCES metrics endpoint
+    metrics_path: '/metrics'
+    scheme: 'http'
+
+  - job_name: 'system'
+    static_configs:
+      - targets: ['localhost:8001']  # System metrics endpoint
+    metrics_path: '/system/metrics'
+    scheme: 'http'
+    scrape_interval: 15s
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: 'system_(.*)'
+        target_label: metric_type
+        replacement: 'system'
+
+  - job_name: 'components'
+    static_configs:
+      - targets: ['localhost:8001']  # Component metrics endpoint
+    metrics_path: '/system/components'
+    scheme: 'http'
+    scrape_interval: 30s
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: 'component_(.*)'
+        target_label: metric_type
+        replacement: 'component'
+
+rule_files:
+  # Alert rules can be added here
+  []
+
+alerting:
+  alertmanagers:
+  - static_configs:
+    - targets:
+      # Alertmanager targets can be added here
+      []

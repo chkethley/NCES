@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ title }}</title>
+    <link rel="stylesheet" href="/static/css/main.css">
+    <script src="https://cdn.plot.ly/plotly-2.20.0.min.js"></script>
+    <script src="/static/js/dashboard.js"></script>
+</head>
+<body>
+    <div class="header">
+        <h1>{{ system_name }}</h1>
+        <div class="header-controls">
+            <div class="system-status">
+                <span class="status-indicator"></span>
+                <span class="status-text">System Status</span>
+            </div>
+            <button id="theme-toggle" class="theme-toggle" title="Toggle dark/light mode">
+                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+                </svg>
+            </button>
+        </div>
+    </div>
+
+    <div class="container">
+        <div class="sidebar">
+            <div class="nav-item active" data-section="overview">Overview</div>
+            <div class="nav-item" data-section="components">Components</div>
+            <div class="nav-item" data-section="crews">Crews</div>
+            <div class="nav-item" data-section="metrics">Metrics</div>
+            <div class="nav-item" data-section="events">Events</div>
+        </div>
+
+        <div class="main-content">
+            <!-- Overview Section -->
+            <section id="overview" class="section active">
+                <h2>System Overview</h2>
+                <div class="metrics-grid">
+                    <div class="metric-card" id="cpu-usage">
+                        <h3>CPU Usage</h3>
+                        <div class="metric-value">--</div>
+                    </div>
+                    <div class="metric-card" id="memory-usage">
+                        <h3>Memory Usage</h3>
+                        <div class="metric-value">--</div>
+                    </div>
+                    <div class="metric-card" id="active-crews">
+                        <h3>Active Crews</h3>
+                        <div class="metric-value">--</div>
+                    </div>
+                    <div class="metric-card" id="active-components">
+                        <h3>Active Components</h3>
+                        <div class="metric-value">--</div>
+                    </div>
+                </div>
+                <div class="charts-container">
+                    <div id="resources-chart"></div>
+                    <div id="events-chart"></div>
+                </div>
+            </section>
+
+            <!-- Components Section -->
+            <section id="components" class="section">
+                <h2>System Components</h2>
+                <div class="components-grid" id="components-list">
+                    <!-- Components will be added here dynamically -->
+                </div>
+            </section>
+
+            <!-- Crews Section -->
+            <section id="crews" class="section">
+                <h2>Active Crews</h2>
+                <div class="crews-container" id="crews-list">
+                    <!-- Crews will be added here dynamically -->
+                </div>
+            </section>
+
+            <!-- Metrics Section -->
+            <section id="metrics" class="section">
+                <h2>System Metrics</h2>
+                <div class="metrics-controls">
+                    <select id="metric-type">
+                        <option value="system">System</option>
+                        <option value="application">Application</option>
+                        <option value="optimization">Optimization</option>
+                    </select>
+                    <select id="time-range">
+                        <option value="1h">Last Hour</option>
+                        <option value="24h">Last 24 Hours</option>
+                        <option value="7d">Last 7 Days</option>
+                    </select>
+                </div>
+                <div id="metrics-chart"></div>
+            </section>
+
+            <!-- Events Section -->
+            <section id="events" class="section">
+                <h2>System Events</h2>
+                <div class="events-controls">
+                    <select id="event-type">
+                        <option value="all">All Events</option>
+                        <option value="system">System</option>
+                        <option value="crew">Crew</option>
+                        <option value="resource">Resource</option>
+                        <option value="error">Errors</option>
+                    </select>
+                    <button id="clear-events">Clear</button>
+                </div>
+                <div class="events-list" id="events-log">
+                    <!-- Events will be added here dynamically -->
+                </div>
+            </section>
+        </div>
+    </div>
+
+    <script>
+        // Initialize dashboard
+        document.addEventListener('DOMContentLoaded', function() {
+            initializeDashboard({
+                wsUrl: `ws://${location.host}/ws`,
+                updateInterval: 5000
+            });
+        });
+    </script>
+</body>
+</html>

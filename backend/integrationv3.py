@@ -39,8 +39,8 @@ try:
         MetricsManager, trace, SpanKind, Status, StatusCode, get_circuit_breaker
     )
     # Import other components if needed (e.g., MemoryV3, ReasoningV3 for Agents)
-    from memoryv3 import MemoryV3
-    from reasoningv3 import ReasoningV3
+    from backend.memoryv3 import MemoryV3
+    from backend.reasoningv3 import ReasoningV3
 except ImportError as e:
     print(f"FATAL ERROR: Could not import dependencies from enhanced-core-v2/*v3: {e}")
     # Add dummy fallbacks
@@ -202,590 +202,299 @@ class Agent(Protocol):
      async def get_status(self) -> AgentState: ...
 
 
-# --- Concrete Implementations (Placeholders/Simple Examples) ---
+# --- Agent Implementations ---
 
-class DummyLLMInterface:
-     provider_name = "dummy"
-     model_name = "dummy-model"
-     async def initialize(self, config: LLMProviderConfig, security_manager: Optional[SecurityManager]):
-         logger.warning("Using DummyLLMInterface.")
-     async def generate(self, prompt: str, **kwargs) -> str:
-         await asyncio.sleep(0.1)
-         return f"Dummy response to: {prompt[:50]}..."
-     async def chat(self, messages: List[Dict[str, str]], **kwargs) -> Dict[str, str]:
-         await asyncio.sleep(0.1)
-         last_msg = messages[-1]['content'] if messages else "empty chat"
-         return {"role": "assistant", "content": f"Dummy chat response to: {last_msg[:50]}..."}
-     async def health(self) -> Tuple[bool, str]: return True, "Dummy LLM OK"
-
-class OpenAILLMInterface:
-    """Production-ready OpenAI API integration."""
-    provider_name = "openai"
+class BaseAgent(ABC):
+    """Abstract base class for NCES agents."""
     
-    def __init__(self):
-        self.model_name = "gpt-4o"
-        self.client = None
-        self.config = None
-        self.security_manager = None
-        self.circuit_breaker = None
-        self._last_error = None
-        self._token_counter = None
+    def __init__(self, agent_id: AgentID, agent_type: str):
+        self.agent_id = agent_id
+        self.agent_type = agent_type
+        self.state = AgentState(agent_id=agent_id, agent_type=agent_type)
+        self.config: Optional[AgentConfig] = None
+        self.integration: Optional[IntegrationV3] = None
+        self.memory = None  # Will be set during initialization
+        self.reasoning = None  # Will be set during initialization
+        self.llm = None  # Will be set during initialization
+        self._task_queue: asyncio.Queue = asyncio.Queue()
+        self._current_task: Optional[asyncio.Task] = None
+        self._stop_event = asyncio.Event()
+        self.logger = logging.getLogger(f"NCES.Agent.{agent_type}.{agent_id[:8]}")
     
-    async def initialize(self, config: LLMProviderConfig, security_manager: Optional[SecurityManager]):
-        """Initialize the OpenAI client with proper API configuration."""
-        import os
-        from openai import AsyncOpenAI, AsyncAzureOpenAI, RateLimitError
-        from tiktoken import encoding_for_model, get_encoding
-        
+    async def initialize(self, config: AgentConfig, integration_manager: 'IntegrationV3'):
+        """Initialize the agent with configuration and dependencies."""
         self.config = config
-        self.model_name = config.model_name
-        self.security_manager = security_manager
+        self.integration = integration_manager
         
-        # Setup API key
-        api_key = None
-        if config.api_key:
-            api_key = config.api_key
-        elif config.api_key_env_var:
-            api_key = os.environ.get(config.api_key_env_var)
+        # Get required components
+        if "MemoryV3" in config.required_components:
+            self.memory = await integration_manager.nces.registry.get_component("MemoryV3")
+        if "ReasoningV3" in config.required_components:
+            self.reasoning = await integration_manager.nces.registry.get_component("ReasoningV3")
         
-        if not api_key:
-            raise ValueError(f"No API key provided for OpenAI. Set in config or environment variable {config.api_key_env_var}")
+        # Get default LLM interface
+        self.llm = await integration_manager.get_llm()
         
-        # Configure HTTP client options
-        http_options = {
-            "timeout": config.request_timeout_seconds,
-            "max_retries": config.max_retries,
-        }
+        self.state.status = 'idle'
+        self.logger.info(f"Agent initialized with config: {config}")
+    
+    async def start_task(self, task_description: str, context: Optional[Dict] = None) -> bool:
+        """Add a task to the agent's queue."""
+        if self.state.status == 'stopped':
+            return False
         
-        # Handle proxy settings if provided
-        if config.http_proxy or config.https_proxy:
-            http_options["proxies"] = {}
-            if config.http_proxy:
-                http_options["proxies"]["http"] = config.http_proxy
-            if config.https_proxy:
-                http_options["proxies"]["https"] = config.https_proxy
+        await self._task_queue.put((task_description, context or {}))
+        if self.state.status == 'idle':
+            self._current_task = asyncio.create_task(self._process_tasks())
+            self.state.status = 'running'
         
-        # Basic client args
-        client_args = {
-            "api_key": api_key,
-            "timeout": config.request_timeout_seconds,
-            "max_retries": config.max_retries,
-        }
+        return True
+    
+    async def step(self) -> bool:
+        """Perform one step of the current task."""
+        if not self._current_task or self.state.status != 'running':
+            return False
         
-        # Add organization if provided
-        if config.organization_id:
-            client_args["organization"] = config.organization_id
+        # Check if current task is done
+        if self._task_queue.empty() and not self.state.current_task:
+            self.state.status = 'idle'
+            return False
         
-        # Add base URL if provided
-        if config.api_base_url:
-            client_args["base_url"] = config.api_base_url
-        
-        # Initialize Azure OpenAI client if Azure is specified in base URL
-        if config.api_base_url and "azure" in config.api_base_url.lower():
-            if not config.api_version:
-                raise ValueError("API version is required for Azure OpenAI")
-            client_args["api_version"] = config.api_version
-            self.client = AsyncAzureOpenAI(**client_args)
-            self.provider_name = "azure_openai"
-        else:
-            # Standard OpenAI client
-            self.client = AsyncOpenAI(**client_args)
-        
-        # Set up token counting
-        try:
-            # Try model-specific encoding
-            self._token_counter = encoding_for_model(self.model_name)
-        except (KeyError, ImportError):
+        return True
+    
+    async def pause(self):
+        """Pause the agent's task processing."""
+        if self.state.status == 'running':
+            self.state.status = 'paused'
+            # Don't cancel current task, just stop processing new ones
+    
+    async def resume(self):
+        """Resume the agent's task processing."""
+        if self.state.status == 'paused':
+            self.state.status = 'running'
+            if not self._current_task or self._current_task.done():
+                self._current_task = asyncio.create_task(self._process_tasks())
+    
+    async def stop(self):
+        """Stop the agent completely."""
+        self._stop_event.set()
+        if self._current_task and not self._current_task.done():
+            self._current_task.cancel()
             try:
-                # Fall back to cl100k_base for newer models
-                self._token_counter = get_encoding("cl100k_base")
-            except (KeyError, ImportError):
-                logger.warning(f"Could not load tokenizer for {self.model_name}. Token counting will be estimated.")
-                self._token_counter = None
-        
-        # Set up circuit breaker if enabled
-        if config.enable_circuit_breaker:
-            import pybreaker
-            self.circuit_breaker = pybreaker.CircuitBreaker(
-                fail_max=config.circuit_breaker_failure_threshold,
-                reset_timeout=config.circuit_breaker_recovery_timeout,
-                exclude=[RateLimitError]  # Don't trip circuit breaker on rate limits
-            )
-            logger.info(f"Circuit breaker enabled for {self.model_name}")
-        
-        logger.info(f"Initialized OpenAI interface for model {self.model_name}")
+                await self._current_task
+            except asyncio.CancelledError:
+                pass
+        self.state.status = 'stopped'
+    
+    async def get_status(self) -> AgentState:
+        """Get the current state of the agent."""
+        return self.state
+    
+    async def _process_tasks(self):
+        """Main task processing loop."""
+        try:
+            while not self._stop_event.is_set():
+                if self.state.status == 'paused':
+                    await asyncio.sleep(1)  # Check pause status periodically
+                    continue
+                
+                try:
+                    task_desc, context = await asyncio.wait_for(
+                        self._task_queue.get(),
+                        timeout=1.0  # Poll for stop/pause periodically
+                    )
+                except asyncio.TimeoutError:
+                    continue
+                
+                self.state.current_task = task_desc
+                try:
+                    await self._execute_task(task_desc, context)
+                except Exception as e:
+                    self.logger.error(f"Error executing task: {e}", exc_info=True)
+                    self.state.status = 'failed'
+                    break
+                finally:
+                    self.state.current_task = None
+                    self._task_queue.task_done()
+            
+            if self._stop_event.is_set():
+                self.state.status = 'stopped'
+            elif self.state.status != 'failed':
+                self.state.status = 'idle'
+                
+        except asyncio.CancelledError:
+            self.state.status = 'stopped'
+            raise
+    
+    @abstractmethod
+    async def _execute_task(self, task_description: str, context: Dict):
+        """Execute a specific task. Must be implemented by subclasses."""
+        raise NotImplementedError()
 
-    async def generate(self, prompt: str, **kwargs) -> str:
-        """Generate text completion using OpenAI API."""
-        messages = [{"role": "user", "content": prompt}]
-        response = await self.chat(messages, **kwargs)
-        return response.get("content", "")
+class ResearchAssistantAgent(BaseAgent):
+    """An agent specialized in research tasks using memory and reasoning."""
     
-    async def _count_tokens(self, messages: List[Dict[str, str]]) -> int:
-        """Count the number of tokens in a message list."""
-        if not self._token_counter:
-            # Rough estimation if no tokenizer available
-            return sum(len(m.get("content", "")) // 4 for m in messages)
-        
-        # Proper token counting
-        token_count = 0
-        for message in messages:
-            content = message.get("content", "")
-            role = message.get("role", "user")
-            token_count += len(self._token_counter.encode(content))
-            token_count += len(self._token_counter.encode(role))
-            # Add overhead for message formatting
-            token_count += 4  # Each message has format overhead
-        
-        # Add per-request overhead
-        token_count += 2
-        
-        return token_count
+    def __init__(self, agent_id: AgentID, agent_type: str = "research_assistant"):
+        super().__init__(agent_id, agent_type)
+        self.research_results = {}  # Store research results by task
     
-    async def _make_api_call(self, func, *args, **kwargs):
-        """Make an API call with circuit breaker and retries."""
-        import time
-        import random
-        from openai import RateLimitError, APIError
+    async def _execute_task(self, task_description: str, context: Dict):
+        """Execute a research task using memory search and reasoning."""
+        if not self.memory or not self.reasoning or not self.llm:
+            raise RuntimeError("Required components not initialized")
         
-        # Apply circuit breaker if available
-        if self.circuit_breaker:
-            api_func = self.circuit_breaker(func)
-        else:
-            api_func = func
+        # 1. Analyze task and generate research plan using reasoning
+        plan_result = await self.reasoning.execute_reasoning(
+            query=f"Create a research plan for: {task_description}",
+            strategy_name="deductive",  # Use deductive reasoning for planning
+            initial_context=context
+        )
         
-        # Get backoff parameters
-        base = self.config.exponential_backoff_base
-        jitter = self.config.jitter_factor
-        max_retries = self.config.max_retries
+        research_plan = plan_result.conclusions if hasattr(plan_result, 'conclusions') else []
+        self.logger.info(f"Generated research plan with {len(research_plan)} steps")
         
-        # Start tracking metrics
-        start_time = time.time()
-        retry_count = 0
-        
-        while True:
-            try:
-                return await api_func(*args, **kwargs)
-            
-            except RateLimitError as e:
-                retry_count += 1
-                if retry_count > max_retries:
-                    self._last_error = str(e)
-                    logger.error(f"Rate limit exceeded for {self.model_name} after {retry_count} retries")
-                    raise
-                
-                # Exponential backoff with jitter
-                delay = (base ** retry_count) * (1 + random.uniform(-jitter, jitter))
-                logger.warning(f"Rate limited by OpenAI, retrying in {delay:.2f}s ({retry_count}/{max_retries})")
-                await asyncio.sleep(delay)
-            
-            except APIError as e:
-                retry_count += 1
-                if retry_count > max_retries or "internal server error" not in str(e).lower():
-                    self._last_error = str(e)
-                    logger.error(f"API error for {self.model_name}: {e}")
-                    raise
-                
-                # Backoff for server errors
-                delay = (base ** retry_count) * (1 + random.uniform(-jitter, jitter))
-                logger.warning(f"OpenAI server error, retrying in {delay:.2f}s ({retry_count}/{max_retries})")
-                await asyncio.sleep(delay)
-            
-            except Exception as e:
-                self._last_error = str(e)
-                logger.error(f"Unexpected error in OpenAI call: {e}")
-                raise
-    
-    async def chat(self, messages: List[Dict[str, str]], **kwargs) -> Dict[str, str]:
-        """Generate chat completion using OpenAI API."""
-        # Start tracing if available
-        if trace:
-            span_context = None
-            tracer = trace.get_tracer(__name__)
-            with tracer.start_as_current_span(f"OpenAI.chat.{self.model_name}", kind=SpanKind.CLIENT) as span:
-                span.set_attribute("llm.provider", self.provider_name)
-                span.set_attribute("llm.model", self.model_name)
-                span.set_attribute("llm.messages_count", len(messages))
-                
-                # Count tokens if enabled
-                if self._token_counter and self.config.include_token_usage_metrics:
-                    input_tokens = await self._count_tokens(messages)
-                    span.set_attribute("llm.input_tokens", input_tokens)
-                
-                # Include prompt in trace attributes if allowed
-                if self.config.log_prompts:
-                    span.set_attribute("llm.prompt", str(messages)[:1000])  # Truncate for trace size limits
-                
-                result = await self._execute_chat(messages, **kwargs)
-                
-                # Record completion time and tokens
-                if self.config.include_token_usage_metrics and "usage" in result.get("_metadata", {}):
-                    usage = result["_metadata"]["usage"]
-                    span.set_attribute("llm.output_tokens", usage.get("completion_tokens", 0))
-                    span.set_attribute("llm.total_tokens", usage.get("total_tokens", 0))
-                
-                if self.config.log_responses:
-                    span.set_attribute("llm.response", result.get("content", "")[:1000])
-                
-                return result
-        else:
-            return await self._execute_chat(messages, **kwargs)
-    
-    async def _execute_chat(self, messages: List[Dict[str, str]], **kwargs) -> Dict[str, str]:
-        """Execute the actual chat completion API call."""
-        # Merge config defaults with call-specific params
-        params = {**self.config.default_params}
-        params.update(kwargs)
-        
-        # Prepare standard OpenAI parameters
-        openai_params = {
-            "model": self.model_name,
-            "messages": messages,
-        }
-        
-        # Add standard parameters
-        for param in ["temperature", "max_tokens", "top_p", "frequency_penalty", 
-                      "presence_penalty", "stop", "seed", "response_format"]:
-            if param in params:
-                openai_params[param] = params[param]
-        
-        # Execute API call with retries and circuit breaker
-        try:
-            response = await self._make_api_call(
-                self.client.chat.completions.create,
-                **openai_params,
-                stream=self.config.streaming
+        # 2. Execute each step of the research plan
+        findings = []
+        for step in research_plan:
+            # Search memory for relevant information
+            memory_results = await self.memory.search_vector_memory(
+                query=step,
+                top_k=5,
+                required_metadata=context.get('metadata_filters')
             )
             
-            if self.config.streaming:
-                # Handle streaming response
-                chunks = []
-                async for chunk in response:
-                    chunks.append(chunk)
-                # Process chunks into a complete response
-                content = "".join(choice.delta.content or "" 
-                                  for chunk in chunks 
-                                  for choice in chunk.choices 
-                                  if hasattr(choice, 'delta') and hasattr(choice.delta, 'content'))
-                role = "assistant"
-                
-                # Extract usage from last chunk if available
-                usage = None
-                if hasattr(chunks[-1], 'usage'):
-                    usage = chunks[-1].usage
-            else:
-                # Handle regular response
-                content = response.choices[0].message.content
-                role = response.choices[0].message.role
-                usage = response.usage
-            
-            # Track costs if enabled
-            if self.config.track_costs and usage and self.config.cost_per_1k_input_tokens and self.config.cost_per_1k_output_tokens:
-                input_cost = (usage.prompt_tokens / 1000) * self.config.cost_per_1k_input_tokens
-                output_cost = (usage.completion_tokens / 1000) * self.config.cost_per_1k_output_tokens
-                total_cost = input_cost + output_cost
-                logger.debug(f"Request cost: ${total_cost:.6f} (${input_cost:.6f} input, ${output_cost:.6f} output)")
-            
-            # Return standardized response with metadata
-            result = {
-                "role": role,
-                "content": content,
-                "_metadata": {
-                    "model": self.model_name,
-                    "usage": usage._asdict() if usage else None,
-                    "timestamp": time.time()
-                }
-            }
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"Error generating completion with {self.model_name}: {e}")
-            return {"role": "assistant", "content": f"Error: {str(e)[:100]}...", "_error": str(e)}
-    
-    async def health(self) -> Tuple[bool, str]:
-        """Check if the OpenAI client is healthy."""
-        if not self.client:
-            return False, "OpenAI client not initialized"
-        
-        if self._last_error:
-            return False, f"Last error: {self._last_error}"
-        
-        # Simple health check through models endpoint
-        try:
-            await self._make_api_call(self.client.models.list)
-            return True, f"OpenAI {self.model_name} connection OK"
-        except Exception as e:
-            self._last_error = str(e)
-            return False, f"OpenAI health check failed: {str(e)[:100]}"
-
-
-class AnthropicLLMInterface:
-    """Production-ready Anthropic API integration."""
-    provider_name = "anthropic"
-    
-    def __init__(self):
-        self.model_name = "claude-3-opus-20240229"
-        self.client = None
-        self.config = None
-        self.security_manager = None
-        self.circuit_breaker = None
-        self._last_error = None
-    
-    async def initialize(self, config: LLMProviderConfig, security_manager: Optional[SecurityManager]):
-        """Initialize the Anthropic client with proper API configuration."""
-        import os
-        import anthropic
-        from anthropic import AsyncAnthropic, RateLimitError
-        
-        self.config = config
-        self.model_name = config.model_name
-        self.security_manager = security_manager
-        
-        # Setup API key
-        api_key = None
-        if config.api_key:
-            api_key = config.api_key
-        elif config.api_key_env_var:
-            api_key = os.environ.get(config.api_key_env_var)
-        
-        if not api_key:
-            raise ValueError(f"No API key provided for Anthropic. Set in config or environment variable {config.api_key_env_var}")
-        
-        # Basic client args
-        client_args = {
-            "api_key": api_key,
-            "timeout": config.request_timeout_seconds,
-            "max_retries": config.max_retries,
-        }
-        
-        # Add base URL if provided
-        if config.api_base_url:
-            client_args["base_url"] = config.api_base_url
-        
-        # Initialize the client
-        self.client = AsyncAnthropic(**client_args)
-        
-        # Set up circuit breaker if enabled
-        if config.enable_circuit_breaker:
-            import pybreaker
-            self.circuit_breaker = pybreaker.CircuitBreaker(
-                fail_max=config.circuit_breaker_failure_threshold,
-                reset_timeout=config.circuit_breaker_recovery_timeout,
-                exclude=[RateLimitError]  # Don't trip circuit breaker on rate limits
+            # Analyze findings using reasoning
+            analysis = await self.reasoning.execute_reasoning(
+                query="Analyze and synthesize the following information:\n" + \
+                      "\n".join(str(item.content) for item, _ in memory_results),
+                strategy_name="inductive",  # Use inductive reasoning for analysis
+                initial_context={"task": task_description, "step": step}
             )
-        
-        logger.info(f"Initialized Anthropic interface for model {self.model_name}")
-    
-    async def _make_api_call(self, func, *args, **kwargs):
-        """Make an API call with circuit breaker and retries."""
-        import time
-        import random
-        from anthropic import RateLimitError, APIError
-        
-        # Apply circuit breaker if available
-        if self.circuit_breaker:
-            api_func = self.circuit_breaker(func)
-        else:
-            api_func = func
-        
-        # Get backoff parameters
-        base = self.config.exponential_backoff_base
-        jitter = self.config.jitter_factor
-        max_retries = self.config.max_retries
-        
-        # Start tracking metrics
-        retry_count = 0
-        
-        while True:
-            try:
-                return await api_func(*args, **kwargs)
             
-            except RateLimitError as e:
-                retry_count += 1
-                if retry_count > max_retries:
-                    self._last_error = str(e)
-                    logger.error(f"Rate limit exceeded for {self.model_name} after {retry_count} retries")
-                    raise
-                
-                # Exponential backoff with jitter
-                delay = (base ** retry_count) * (1 + random.uniform(-jitter, jitter))
-                logger.warning(f"Rate limited by Anthropic, retrying in {delay:.2f}s ({retry_count}/{max_retries})")
-                await asyncio.sleep(delay)
-            
-            except APIError as e:
-                retry_count += 1
-                if retry_count > max_retries or "internal server error" not in str(e).lower():
-                    self._last_error = str(e)
-                    logger.error(f"API error for {self.model_name}: {e}")
-                    raise
-                
-                # Backoff for server errors
-                delay = (base ** retry_count) * (1 + random.uniform(-jitter, jitter))
-                logger.warning(f"Anthropic server error, retrying in {delay:.2f}s ({retry_count}/{max_retries})")
-                await asyncio.sleep(delay)
-            
-            except Exception as e:
-                self._last_error = str(e)
-                logger.error(f"Unexpected error in Anthropic call: {e}")
-                raise
-    
-    async def generate(self, prompt: str, **kwargs) -> str:
-        """Generate text using Anthropic API."""
-        response = await self.chat([{"role": "user", "content": prompt}], **kwargs)
-        return response.get("content", "")
-    
-    async def chat(self, messages: List[Dict[str, str]], **kwargs) -> Dict[str, str]:
-        """Generate chat completion using Anthropic API."""
-        # Start tracing if available
-        if trace:
-            tracer = trace.get_tracer(__name__)
-            with tracer.start_as_current_span(f"Anthropic.chat.{self.model_name}", kind=SpanKind.CLIENT) as span:
-                span.set_attribute("llm.provider", self.provider_name)
-                span.set_attribute("llm.model", self.model_name)
-                span.set_attribute("llm.messages_count", len(messages))
-                
-                # Include prompt in trace attributes if allowed
-                if self.config.log_prompts:
-                    span.set_attribute("llm.prompt", str(messages)[:1000])  # Truncate for trace size limits
-                
-                result = await self._execute_chat(messages, **kwargs)
-                
-                if self.config.log_responses:
-                    span.set_attribute("llm.response", result.get("content", "")[:1000])
-                
-                return result
-        else:
-            return await self._execute_chat(messages, **kwargs)
-    
-    async def _execute_chat(self, messages: List[Dict[str, str]], **kwargs) -> Dict[str, str]:
-        """Execute the actual chat completion API call."""
-        import anthropic
-        
-        # Merge config defaults with call-specific params
-        params = {**self.config.default_params}
-        params.update(kwargs)
-        
-        # Convert the messages list to Anthropic format
-        anthropic_messages = []
-        for msg in messages:
-            role = msg.get("role", "user").lower()
-            # Map roles: OpenAI -> Anthropic
-            if role == "system":
-                # System messages need special handling in Anthropic
-                system_content = msg.get("content", "")
-                continue  # Will handle system prompt separately
-            elif role == "assistant":
-                anthropic_role = anthropic.ASSISTANT
-            else:  # user or any other role
-                anthropic_role = anthropic.USER
-            
-            anthropic_messages.append({
-                "role": anthropic_role,
-                "content": msg.get("content", "")
+            findings.append({
+                "step": step,
+                "sources": [item.id for item, _ in memory_results],
+                "analysis": analysis.conclusions if hasattr(analysis, 'conclusions') else []
             })
         
-        # Prepare Anthropic parameters
-        anthropic_params = {
-            "model": self.model_name,
-            "messages": anthropic_messages,
+        # 3. Synthesize findings using LLM
+        synthesis_prompt = (
+            f"Task: {task_description}\n\n"
+            "Research Findings:\n" + 
+            "\n".join(f"- {f['step']}:\n  {', '.join(f['analysis'])}" for f in findings)
+        )
+        
+        synthesis = await self.llm.generate(
+            prompt=synthesis_prompt,
+            max_tokens=1000,
+            temperature=0.7
+        )
+        
+        # 4. Store results in memory for future reference
+        await self.memory.add_memory(
+            content={
+                "task": task_description,
+                "findings": findings,
+                "synthesis": synthesis
+            },
+            metadata={
+                "agent_id": self.agent_id,
+                "task_type": "research",
+                "timestamp": time.time()
+            }
+        )
+        
+        # Store results for retrieval
+        self.research_results[task_description] = {
+            "findings": findings,
+            "synthesis": synthesis,
+            "completed_at": time.time()
         }
         
-        # Handle system message if it exists
-        if "system_content" in locals() and system_content:
-            anthropic_params["system"] = system_content
-        
-        # Add standard parameters with mapping to Anthropic naming
-        if "temperature" in params:
-            anthropic_params["temperature"] = params["temperature"]
-        if "max_tokens" in params:
-            anthropic_params["max_tokens"] = params["max_tokens"]
-        if "top_p" in params:
-            anthropic_params["top_p"] = params["top_p"]
-        if "stop" in params and params["stop"]:
-            anthropic_params["stop_sequences"] = params["stop"] if isinstance(params["stop"], list) else [params["stop"]]
-        
-        # Execute API call with retries and circuit breaker
-        try:
-            response = await self._make_api_call(
-                self.client.messages.create,
-                **anthropic_params,
-                stream=self.config.streaming
-            )
-            
-            if self.config.streaming:
-                # Handle streaming response
-                chunks = []
-                complete_content = ""
-                
-                async for chunk in response:
-                    chunks.append(chunk)
-                    if chunk.type == "content_block_delta" and chunk.delta.type == "text":
-                        complete_content += chunk.delta.text
-                
-                # Return the aggregated response
-                result = {
-                    "role": "assistant",
-                    "content": complete_content,
-                    "_metadata": {
-                        "model": self.model_name,
-                        "timestamp": time.time()
-                    }
-                }
-            else:
-                # Handle regular response
-                content = response.content[0].text
-                
-                # Return standardized response with metadata
-                result = {
-                    "role": "assistant",
-                    "content": content,
-                    "_metadata": {
-                        "model": self.model_name,
-                        "usage": {
-                            "input_tokens": response.usage.input_tokens,
-                            "output_tokens": response.usage.output_tokens,
-                            "total_tokens": response.usage.input_tokens + response.usage.output_tokens
-                        },
-                        "timestamp": time.time()
-                    }
-                }
-            
-            # Track costs if enabled
-            if self.config.track_costs and "usage" in result["_metadata"] and self.config.cost_per_1k_input_tokens and self.config.cost_per_1k_output_tokens:
-                usage = result["_metadata"]["usage"]
-                input_cost = (usage["input_tokens"] / 1000) * self.config.cost_per_1k_input_tokens
-                output_cost = (usage["output_tokens"] / 1000) * self.config.cost_per_1k_output_tokens
-                total_cost = input_cost + output_cost
-                logger.debug(f"Request cost: ${total_cost:.6f} (${input_cost:.6f} input, ${output_cost:.6f} output)")
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"Error generating completion with {self.model_name}: {e}")
-            return {"role": "assistant", "content": f"Error: {str(e)[:100]}...", "_error": str(e)}
-    
-    async def health(self) -> Tuple[bool, str]:
-        """Check if the Anthropic client is healthy."""
-        if not self.client:
-            return False, "Anthropic client not initialized"
-        
-        if self._last_error:
-            return False, f"Last error: {self._last_error}"
-        
-        try:
-            # Simple ping to the API with a minimal messages list
-            await self._make_api_call(
-                self.client.messages.create,
-                model=self.model_name,
-                max_tokens=1,
-                messages=[{"role": "user", "content": "ping"}]
-            )
-            return True, f"Anthropic {self.model_name} connection OK"
-        except Exception as e:
-            self._last_error = str(e)
-            return False, f"Anthropic health check failed: {str(e)[:100]}"
+        self.logger.info(f"Completed research task: {task_description[:100]}...")
 
+class CodeAssistantAgent(BaseAgent):
+    """An agent specialized in code-related tasks."""
+    
+    def __init__(self, agent_id: AgentID, agent_type: str = "code_assistant"):
+        super().__init__(agent_id, agent_type)
+        self.code_snippets = {}  # Store generated code by task
+    
+    async def _execute_task(self, task_description: str, context: Dict):
+        """Execute a code-related task."""
+        if not self.memory or not self.reasoning or not self.llm:
+            raise RuntimeError("Required components not initialized")
+        
+        # 1. Analyze task and plan implementation
+        plan_result = await self.reasoning.execute_reasoning(
+            query=f"Create an implementation plan for: {task_description}",
+            strategy_name="deductive",
+            initial_context={
+                **context,
+                "task_type": "code",
+                "programming_language": context.get("language", "python")
+            }
+        )
+        
+        impl_plan = plan_result.conclusions if hasattr(plan_result, 'conclusions') else []
+        self.logger.info(f"Generated implementation plan with {len(impl_plan)} steps")
+        
+        # 2. Search for relevant code examples
+        relevant_code = await self.memory.search_vector_memory(
+            query=task_description,
+            top_k=3,
+            required_metadata={"type": "code_snippet"}
+        )
+        
+        # 3. Generate code implementation
+        code_prompt = (
+            f"Task: {task_description}\n\n"
+            f"Implementation Plan:\n" + "\n".join(f"- {step}" for step in impl_plan) + "\n\n"
+            "Similar Code Examples:\n" + 
+            "\n".join(f"Example {i+1}:\n```\n{item.content}\n```" 
+                     for i, (item, _) in enumerate(relevant_code))
+        )
+        
+        implementation = await self.llm.generate(
+            prompt=code_prompt,
+            max_tokens=2000,
+            temperature=0.2  # Lower temperature for code generation
+        )
+        
+        # 4. Validate implementation using reasoning
+        validation = await self.reasoning.execute_reasoning(
+            query="Validate the following code implementation:\n" + implementation,
+            strategy_name="analytical",
+            initial_context={
+                "task": task_description,
+                "language": context.get("language", "python"),
+                "requirements": context.get("requirements", [])
+            }
+        )
+        
+        # 5. Store the validated code
+        code_id = await self.memory.add_memory(
+            content={
+                "task": task_description,
+                "code": implementation,
+                "validation": validation.conclusions if hasattr(validation, 'conclusions') else []
+            },
+            metadata={
+                "agent_id": self.agent_id,
+                "type": "code_snippet",
+                "language": context.get("language", "python"),
+                "timestamp": time.time()
+            }
+        )
+        
+        self.code_snippets[task_description] = {
+            "code_id": code_id,
+            "implementation": implementation,
+            "validation": validation.conclusions if hasattr(validation, 'conclusions') else [],
+            "completed_at": time.time()
+        }
+        
+        self.logger.info(f"Completed code task: {task_description[:100]}...")
 
 # --- IntegrationV3 Component (Agent Manager + External Interface Hub) ---
 
@@ -1033,56 +742,48 @@ class IntegrationV3(Component):
     async def create_agent(self, agent_type_name: str, agent_id: Optional[AgentID] = None) -> Agent:
         """Creates, initializes, and registers a new agent instance."""
         if agent_type_name not in self.agent_configs:
-             raise ValueError(f"Unknown agent type: {agent_type_name}")
+            raise ValueError(f"Unknown agent type: {agent_type_name}")
+        
         if self.config.max_concurrent_agents and len(self.agents) >= self.config.max_concurrent_agents:
-             raise ResourceWarning("Maximum number of concurrent agents reached.") # Use specific exception?
-
+            raise ResourceWarning("Maximum number of concurrent agents reached.")
+        
         agent_config = self.agent_configs[agent_type_name]
         new_agent_id = agent_id or str(uuid.uuid4())
-
-        # --- Agent Class Instantiation (Requires Factory/Registry) ---
-        # This needs a mechanism to map agent_type_name to the actual Agent implementation class
-        AgentClass: Optional[Type[Agent]] = None
-        if agent_type_name == "research_assistant": # Example mapping
-             # from .agents.researcher import ResearchAssistantAgent # Import the actual class
-             # AgentClass = ResearchAssistantAgent
-             pass # Placeholder
-        elif agent_type_name == "default_agent":
-             # from .agents.basic import BasicAgent
-             # AgentClass = BasicAgent
-             pass # Placeholder
-        else:
-             raise NotImplementedError(f"Agent class for type '{agent_type_name}' not found.")
-
-        if AgentClass is None: # If placeholder used
-            raise NotImplementedError(f"Agent class for type '{agent_type_name}' not implemented.")
-
-
+        
+        # Map agent type to class
+        AgentClass = {
+            "research_assistant": ResearchAssistantAgent,
+            "code_assistant": CodeAssistantAgent
+        }.get(agent_type_name)
+        
+        if not AgentClass:
+            raise NotImplementedError(f"Agent type '{agent_type_name}' not implemented")
+        
         # Check if required components are available
         for req_comp in agent_config.required_components:
-             try:
-                 await self.nces.registry.get_component(req_comp)
-             except ComponentNotFoundError:
-                 raise DependencyError(f"Agent type '{agent_type_name}' requires component '{req_comp}' which is not available.")
-
-        # Instantiate and initialize the agent
-        agent_instance = AgentClass(agent_id=new_agent_id, agent_type=agent_type_name)
-        await agent_instance.initialize(agent_config, self) # Pass config and integration manager
-
+            try:
+                await self.nces.registry.get_component(req_comp)
+            except ComponentNotFoundError:
+                raise DependencyError(f"Agent type '{agent_type_name}' requires component '{req_comp}' which is not available.")
+        
+        # Create and initialize agent
+        agent_instance = AgentClass(agent_id=new_agent_id)
+        await agent_instance.initialize(agent_config, self)
+        
         async with self._lock:
             if new_agent_id in self.agents:
-                 raise ValueError(f"Agent with ID {new_agent_id} already exists.")
+                raise ValueError(f"Agent with ID {new_agent_id} already exists")
             self.agents[new_agent_id] = agent_instance
-
-        self.logger.info(f"Created agent '{new_agent_id}' of type '{agent_type_name}'.")
+        
+        self.logger.info(f"Created {agent_type_name} agent '{new_agent_id}'")
         await self.event_bus.publish(Event(
-            type=EventType.SYSTEM, # Or AGENT type
+            type=EventType.SYSTEM,
             subtype="agent_created",
             source=self.name,
             data={"agent_id": new_agent_id, "agent_type": agent_type_name}
         ))
+        
         return agent_instance
-
 
     async def get_agent(self, agent_id: AgentID) -> Optional[Agent]:
         """Retrieves an active agent instance by ID."""

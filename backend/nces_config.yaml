@@ -1,0 +1,178 @@
+system_name: "NCES_Backend"
+base_dir: "./nces_data"
+log_level: "INFO"
+log_file: "logs/nces.log"
+log_json: true
+
+# Security Configuration
+security:
+  encryption_key: ""  # Will be auto-generated if empty
+  token_expiry_seconds: 3600
+  sensitive_keys:
+    - "*.password"
+    - "*.secret"
+    - "*.key"
+    - "*.token"
+    - "*.api_key"
+
+# Storage Configuration
+storage:
+  base_dir: "./storage"
+  file_cache_size_mb: 100
+  enable_compression: true
+  max_versions: 10
+  default_format: "msgpack"
+  index_update_interval_seconds: 300
+
+# Event Bus Configuration
+event_bus:
+  max_history: 1000
+  dispatch_timeout_seconds: 5.0
+  enable_persistence: true
+
+# Memory Component Configuration
+memory:
+  vector_store:
+    type: qdrant
+    url: http://qdrant:6333
+    collection_name: nces_memory
+  embeddings:
+    model: all-MiniLM-L6-v2
+    cache_dir: storage/embeddings
+  cache:
+    type: redis
+    url: redis://redis:6379/0
+    ttl_seconds: 3600
+
+# Integration Component Configuration
+integration:
+  llm_interfaces:
+    openai-gpt4:
+      provider_type: openai
+      model_name: gpt-4
+      api_key_env_var: OPENAI_API_KEY
+      streaming: true
+      max_retries: 3
+      track_costs: true
+      cost_per_1k_input_tokens: 0.03
+      cost_per_1k_output_tokens: 0.06
+    
+    anthropic-claude:
+      provider_type: anthropic
+      model_name: claude-3-opus-20240229
+      api_key_env_var: ANTHROPIC_API_KEY
+      streaming: true
+      max_retries: 3
+      track_costs: true
+      cost_per_1k_input_tokens: 0.015
+      cost_per_1k_output_tokens: 0.075
+  
+  default_llm_interface: openai-gpt4
+  
+  agent_types:
+    - agent_type_name: research_assistant
+      description: "Agent specialized in research tasks using memory and reasoning"
+      required_components:
+        - MemoryV3
+        - ReasoningV3
+        - LLMInterface
+      settings:
+        max_research_depth: 3
+        synthesis_style: comprehensive
+    
+    - agent_type_name: code_assistant
+      description: "Agent specialized in code-related tasks"
+      required_components:
+        - MemoryV3
+        - ReasoningV3
+        - LLMInterface
+      settings:
+        supported_languages:
+          - python
+          - javascript
+          - typescript
+        test_generation: true
+        documentation_style: google
+  
+  max_concurrent_agents: 10
+  enable_api_server: true
+  api_host: 0.0.0.0
+  api_port: 8000
+
+# Evolution Component Configuration
+evolution:
+  population_size: 100
+  generations: 1000
+  mutation_rate: 0.01
+  crossover_rate: 0.7
+  elitism: 2
+  parallel_evaluations: true
+  
+  selection_strategy:
+    type: tournament
+    tournament_size: 5
+  
+  fitness_evaluator:
+    type: distributed
+    timeout_seconds: 300
+  
+  genome_handler:
+    type: float_vector
+    dimensions: 64
+    min_value: -1.0
+    max_value: 1.0
+
+# Reasoning Component Configuration
+reasoning:
+  strategies:
+    - name: deductive
+      type: chain
+      model: gpt-4
+    - name: inductive
+      type: tree
+      model: gpt-4
+    - name: analytical
+      type: graph
+      model: gpt-4
+  cache_results: true
+  max_depth: 5
+  timeout_seconds: 30
+
+# Distributed Execution Configuration
+distributed:
+  node_id: ""  # Will be auto-generated if empty
+  grpc_port: 50051
+  discovery_method: multicast
+  multicast_group: 224.0.0.1
+  multicast_port: 45678
+  heartbeat_interval_seconds: 5
+  node_timeout_seconds: 15
+  
+  task_scheduler:
+    max_concurrent_tasks: 100
+    task_timeout_seconds: 300
+    queue_size: 1000
+
+# Observability Configuration
+observability:
+  enable_tracing: true
+  jaeger_endpoint: http://jaeger:14268/api/traces
+  metrics_port: 8001
+  log_format: json
+
+# System Monitor Configuration
+system_monitor:
+  metrics_interval_seconds: 15
+  history_size: 100
+  alert_thresholds:
+    cpu_percent: 80.0
+    memory_percent: 85.0
+    disk_percent: 90.0
+  
+  # Alert notification channels (placeholder for future implementation)
+  notifications:
+    slack_webhook: ""
+    email:
+      smtp_server: ""
+      from_address: ""
+      to_addresses: []

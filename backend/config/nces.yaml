@@ -1,0 +1,39 @@
+system_name: NCES Docker
+log_level: INFO
+base_dir: /app/data
+log_file: /app/logs/nces.log
+log_json: true
+
+storage:
+  directory: /app/data
+
+event_bus:
+  max_queue_size: 1000
+  worker_threads: 4
+
+distributed:
+  node_id: node-1
+  local_only: true
+  max_workers: 4
+
+llm:
+  default_model: google/gemma-3-8b
+  cache_dir: /app/models
+  device: cpu
+  precision: float16
+  models:
+    google/gemma-3-8b:
+      model_type: GEMMA
+      temperature: 0.7
+      max_tokens_per_request: 1024
+
+api:
+  host: 0.0.0.0
+  port: 8000
+  enable_cors: true
+  enable_auth: false
+
+dashboard:
+  host: 0.0.0.0
+  port: 8080
+  enable_auth: false

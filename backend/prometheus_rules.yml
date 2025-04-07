@@ -1,0 +1,125 @@
+groups:
+  - name: nces_alerts
+    rules:
+      # Resource Usage Alerts
+      - alert: HighCPUUsage
+        expr: system_cpu_percent > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: High CPU usage detected
+          description: CPU usage is above 80% for 5 minutes
+
+      - alert: HighMemoryUsage
+        expr: system_memory_percent > 85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: High memory usage detected
+          description: Memory usage is above 85% for 5 minutes
+
+      - alert: CriticalDiskUsage
+        expr: system_disk_usage_percent > 90
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Critical disk usage detected
+          description: Disk usage is above 90% for 5 minutes
+
+      # Component Health Alerts
+      - alert: ComponentUnhealthy
+        expr: component_health == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Component is unhealthy
+          description: Component {{ $labels.component }} is reporting unhealthy status
+
+      - alert: ComponentHighErrorRate
+        expr: rate(component_errors[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: High error rate detected
+          description: Component {{ $labels.component }} is experiencing a high error rate
+
+      # Service Health Alerts
+      - alert: APIEndpointErrors
+        expr: rate(http_requests{status=~"5.."}[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: High API error rate detected
+          description: API endpoint {{ $labels.path }} is returning errors
+
+      - alert: SlowAPIResponses
+        expr: http_request_duration_seconds{quantile="0.9"} > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Slow API responses detected
+          description: API endpoint {{ $labels.path }} is responding slowly
+
+      # LLM Service Alerts
+      - alert: LLMServiceErrors
+        expr: rate(llm_errors_total[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: High LLM error rate detected
+          description: LLM service {{ $labels.provider }} is experiencing errors
+
+      - alert: LLMHighLatency
+        expr: llm_request_duration_seconds{quantile="0.9"} > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: High LLM latency detected
+          description: LLM service {{ $labels.provider }} is experiencing high latency
+
+      # Memory Component Alerts
+      - alert: VectorStoreErrors
+        expr: rate(vector_store_errors_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Vector store errors detected
+          description: Vector store is experiencing a high error rate
+
+      - alert: HighEmbeddingLatency
+        expr: embedding_generation_duration_seconds{quantile="0.9"} > 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: High embedding generation latency
+          description: Embedding generation is taking longer than expected
+
+      # Agent System Alerts
+      - alert: TooManyAgents
+        expr: sum(agent_count) > 20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Too many concurrent agents
+          description: Number of concurrent agents exceeds recommended limit
+
+      - alert: AgentTaskErrors
+        expr: rate(agent_task_errors_total[5m]) > 0.2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: High agent task error rate
+          description: Agents are experiencing a high task failure rate

@@ -39,7 +39,7 @@ try:
         MetricsManager, trace, SpanKind, Status, StatusCode
     )
     # Import MemoryV3 if evolution depends on it (e.g., evolving agents with memory)
-    from memoryv3 import MemoryV3 # Or specific types needed
+    from backend.memoryv3 import MemoryV3 # Or specific types needed
 except ImportError as e:
     print(f"FATAL ERROR: Could not import dependencies from enhanced-core-v2/memoryv3: {e}")
     # Add dummy fallbacks if needed for basic parsing
