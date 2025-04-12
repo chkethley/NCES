@@ -10,10 +10,10 @@ import readline  # For command history
 from typing import List, Dict, Any, Optional, Tuple
 
 # Configuration
-OPENROUTER_API_KEY = os.environ.get("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")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 # This model ID will be updated with an available free model
-MODEL = "openrouter/optimus-alpha"  # Default, will try to find a free model
-MAX_TOKENS = 20,000
+MODEL = "anthropi/claude-instant-1.2"  # Default, will try to find a free model
+MAX_TOKENS = 5,000
 HISTORY_FILE = os.path.expanduser("~/.agent_one_history")
 
 # ANSI color codes for terminal output
@@ -32,7 +32,7 @@ def setup_history():
     """Set up command history for the terminal interface."""
     try:
         readline.read_history_file(HISTORY_FILE)
-        readline.set_history_length(20000)
+        readline.set_history_length(5000)
     except FileNotFoundError:
         pass
     except Exception as e:
